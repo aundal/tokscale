@@ -156,6 +156,18 @@ fn current_count_label(app: &App) -> String {
             format!(" ({} models)", app.get_sorted_daily_detail_rows().len())
         }
         Tab::Daily => format!(" ({} days)", app.data.daily.len()),
+        Tab::Weekly if app.is_period_detail_active() => {
+            format!(" ({} models)", app.get_sorted_period_detail_rows().len())
+        }
+        Tab::Monthly if app.is_period_detail_active() => {
+            format!(" ({} models)", app.get_sorted_period_detail_rows().len())
+        }
+        Tab::Yearly if app.is_period_detail_active() => {
+            format!(" ({} models)", app.get_sorted_period_detail_rows().len())
+        }
+        Tab::Weekly => format!(" ({} weeks)", app.active_period_len()),
+        Tab::Monthly => format!(" ({} months)", app.active_period_len()),
+        Tab::Yearly => format!(" ({} years)", app.active_period_len()),
         Tab::Hourly => format!(" ({} hours)", app.data.hourly.len()),
         Tab::Minutely => format!(" ({} minutes)", app.data.minutely.len()),
         Tab::Stats | Tab::Usage => String::new(),
@@ -193,6 +205,16 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled("j", Style::default().fg(Color::Yellow)));
             }
         }
+        if app.current_period_kind().is_some() {
+            spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+            if app.is_period_detail_active() {
+                spans.push(Span::styled("esc", Style::default().fg(Color::Yellow)));
+            } else {
+                spans.push(Span::styled("↵", Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
+                spans.push(Span::styled("j", Style::default().fg(Color::Yellow)));
+            }
+        }
         if app.current_tab == Tab::Hourly {
             spans.push(Span::styled("·", Style::default().fg(app.theme.muted)));
             spans.push(Span::styled("v", Style::default().fg(Color::Yellow)));
@@ -221,6 +243,25 @@ fn render_help_row(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(" ", Style::default()));
                 spans.push(Span::styled(
                     "[j:today]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            spans.push(Span::styled(" • ", Style::default().fg(app.theme.muted)));
+        }
+        if app.current_period_kind().is_some() {
+            if app.is_period_detail_active() {
+                spans.push(Span::styled(
+                    "[esc:back]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    "[enter:details]",
+                    Style::default().fg(Color::Yellow),
+                ));
+                spans.push(Span::styled(" ", Style::default()));
+                spans.push(Span::styled(
+                    "[j:current]",
                     Style::default().fg(Color::Yellow),
                 ));
             }

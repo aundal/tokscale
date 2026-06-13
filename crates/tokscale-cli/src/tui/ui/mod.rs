@@ -9,6 +9,7 @@ mod hourly_profile;
 mod minutely;
 mod models;
 mod overview;
+mod period;
 pub mod spinner;
 mod stats;
 mod usage;
@@ -49,6 +50,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Tab::Models => models::render(frame, app, chunks[1]),
             Tab::Agents => agents::render(frame, app, chunks[1]),
             Tab::Daily => daily::render(frame, app, chunks[1]),
+            Tab::Weekly | Tab::Monthly | Tab::Yearly => period::render(frame, app, chunks[1]),
             Tab::Hourly => hourly::render(frame, app, chunks[1]),
             Tab::Minutely => minutely::render(frame, app, chunks[1]),
             Tab::Stats => stats::render(frame, app, chunks[1]),

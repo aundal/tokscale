@@ -14,8 +14,8 @@ use crate::ClientFilter;
 use ratatui::style::Color;
 
 use super::data::{
-    AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelUsage, TokenBreakdown,
-    UsageData,
+    AgentUsage, DailyUsage, DataLoader, HourlyUsage, MinutelyUsage, ModelUsage, PeriodKind,
+    PeriodUsage, TokenBreakdown, UsageData,
 };
 use super::settings::Settings;
 use super::themes::{Theme, ThemeName};
@@ -40,6 +40,9 @@ pub enum Tab {
     Usage,
     Models,
     Daily,
+    Weekly,
+    Monthly,
+    Yearly,
     Hourly,
     Minutely,
     Stats,
@@ -53,6 +56,9 @@ impl Tab {
             Tab::Usage,
             Tab::Models,
             Tab::Daily,
+            Tab::Weekly,
+            Tab::Monthly,
+            Tab::Yearly,
             Tab::Hourly,
             Tab::Minutely,
             Tab::Stats,
@@ -66,6 +72,9 @@ impl Tab {
             Tab::Usage => "Usage",
             Tab::Models => "Models",
             Tab::Daily => "Daily",
+            Tab::Weekly => "Weekly",
+            Tab::Monthly => "Monthly",
+            Tab::Yearly => "Yearly",
             Tab::Hourly => "Hourly",
             Tab::Minutely => "Minutely",
             Tab::Stats => "Stats",
@@ -79,6 +88,9 @@ impl Tab {
             Tab::Usage => "Use",
             Tab::Models => "Mod",
             Tab::Daily => "Day",
+            Tab::Weekly => "Wk",
+            Tab::Monthly => "Mo",
+            Tab::Yearly => "Yr",
             Tab::Hourly => "Hr",
             Tab::Minutely => "Min",
             Tab::Stats => "Sta",
@@ -91,7 +103,10 @@ impl Tab {
             Tab::Overview => Tab::Usage,
             Tab::Usage => Tab::Models,
             Tab::Models => Tab::Daily,
-            Tab::Daily => Tab::Hourly,
+            Tab::Daily => Tab::Weekly,
+            Tab::Weekly => Tab::Monthly,
+            Tab::Monthly => Tab::Yearly,
+            Tab::Yearly => Tab::Hourly,
             Tab::Hourly => Tab::Minutely,
             Tab::Minutely => Tab::Stats,
             Tab::Stats => Tab::Agents,
@@ -105,10 +120,24 @@ impl Tab {
             Tab::Usage => Tab::Overview,
             Tab::Models => Tab::Usage,
             Tab::Daily => Tab::Models,
-            Tab::Hourly => Tab::Daily,
+            Tab::Weekly => Tab::Daily,
+            Tab::Monthly => Tab::Weekly,
+            Tab::Yearly => Tab::Monthly,
+            Tab::Hourly => Tab::Yearly,
             Tab::Minutely => Tab::Hourly,
             Tab::Stats => Tab::Minutely,
             Tab::Agents => Tab::Stats,
+        }
+    }
+
+    /// Whether this tab is one of the calendar-period tabs (Weekly/Monthly/
+    /// Yearly), which share the period table + detail rendering.
+    pub fn period_kind(self) -> Option<PeriodKind> {
+        match self {
+            Tab::Weekly => Some(PeriodKind::Week),
+            Tab::Monthly => Some(PeriodKind::Month),
+            Tab::Yearly => Some(PeriodKind::Year),
+            _ => None,
         }
     }
 }
@@ -220,6 +249,19 @@ pub struct App {
     pub selected_daily_detail_date: Option<NaiveDate>,
     daily_list_selected_index: usize,
     daily_list_scroll_offset: usize,
+
+    /// Weekly/Monthly/Yearly buckets derived from `data.daily` whenever the
+    /// underlying data changes. Owned (not borrowed from `data`) so the
+    /// period detail rows can borrow from them. Rebuilt in
+    /// [`Self::rebuild_periods`].
+    weekly: Vec<PeriodUsage>,
+    monthly: Vec<PeriodUsage>,
+    yearly: Vec<PeriodUsage>,
+    /// Period (key) the user has drilled into on the active period tab.
+    /// Only one period tab is active at a time, so a single field suffices.
+    selected_period_detail_key: Option<String>,
+    period_list_selected_index: usize,
+    period_list_scroll_offset: usize,
 
     pub selected_graph_cell: Option<(usize, usize)>,
     pub stats_breakdown_total_lines: usize,
@@ -349,6 +391,12 @@ impl App {
             selected_daily_detail_date: None,
             daily_list_selected_index: 0,
             daily_list_scroll_offset: 0,
+            weekly: Vec::new(),
+            monthly: Vec::new(),
+            yearly: Vec::new(),
+            selected_period_detail_key: None,
+            period_list_selected_index: 0,
+            period_list_scroll_offset: 0,
             selected_graph_cell: None,
             stats_breakdown_total_lines: 0,
             auto_refresh,
@@ -394,6 +442,7 @@ impl App {
             minutely_sort_cache: RefCell::new(None),
         };
         app.build_model_shade_map();
+        app.rebuild_periods();
         Ok(app)
     }
 
@@ -407,6 +456,7 @@ impl App {
         self.data_version = self.data_version.saturating_add(1);
         self.last_refresh = Instant::now();
         self.build_model_shade_map();
+        self.rebuild_periods();
         self.minutely_sort_cache.borrow_mut().take();
 
         // Exit Daily-detail mode if the refresh dropped the day we were
@@ -420,7 +470,30 @@ impl App {
             }
         }
 
+        // Same guard for the active period tab: if the period we drilled into
+        // no longer exists after the refresh, leave detail mode.
+        if let Some(key) = self.selected_period_detail_key.clone() {
+            let still_present = self
+                .current_period_kind()
+                .map(|kind| self.period_data(kind))
+                .is_some_and(|periods| periods.iter().any(|p| p.key == key));
+            if !still_present {
+                self.selected_period_detail_key = None;
+                self.selected_index = self.period_list_selected_index;
+                self.scroll_offset = self.period_list_scroll_offset;
+            }
+        }
+
         self.clamp_selection();
+    }
+
+    /// Rebuild the Weekly/Monthly/Yearly buckets from the current daily data.
+    /// Cheap: re-buckets the already-aggregated per-day entries, so it runs on
+    /// every data refresh rather than on every render.
+    fn rebuild_periods(&mut self) {
+        self.weekly = super::data::aggregate_periods(&self.data.daily, PeriodKind::Week);
+        self.monthly = super::data::aggregate_periods(&self.data.daily, PeriodKind::Month);
+        self.yearly = super::data::aggregate_periods(&self.data.daily, PeriodKind::Year);
     }
 
     pub fn build_model_shade_map(&mut self) {
@@ -696,6 +769,9 @@ impl App {
             KeyCode::Enter if self.current_tab == Tab::Daily => {
                 self.open_selected_daily_detail();
             }
+            KeyCode::Enter if self.current_period_kind().is_some() => {
+                self.open_selected_period_detail();
+            }
             KeyCode::Enter if self.current_tab == Tab::Stats => {
                 self.handle_graph_selection();
             }
@@ -703,6 +779,11 @@ impl App {
                 if self.current_tab == Tab::Daily && self.is_daily_detail_active() =>
             {
                 self.close_daily_detail();
+            }
+            KeyCode::Esc | KeyCode::Backspace
+                if self.current_period_kind().is_some() && self.is_period_detail_active() =>
+            {
+                self.close_period_detail();
             }
             KeyCode::Esc if self.selected_graph_cell.is_some() => {
                 self.selected_graph_cell = None;
@@ -1071,6 +1152,9 @@ impl App {
         self.selected_daily_detail_date = None;
         self.daily_list_selected_index = 0;
         self.daily_list_scroll_offset = 0;
+        self.selected_period_detail_key = None;
+        self.period_list_selected_index = 0;
+        self.period_list_scroll_offset = 0;
         self.selected_graph_cell = None;
         self.stats_breakdown_total_lines = 0;
     }
@@ -1084,6 +1168,9 @@ impl App {
         }
         if target != Tab::Daily {
             self.selected_daily_detail_date = None;
+        }
+        if target.period_kind().is_none() {
+            self.selected_period_detail_key = None;
         }
 
         let (field, dir) = self
@@ -1250,6 +1337,12 @@ impl App {
                 self.get_sorted_daily_detail_rows().len()
             }
             Tab::Daily => self.data.daily.len(),
+            Tab::Weekly | Tab::Monthly | Tab::Yearly if self.is_period_detail_active() => {
+                self.get_sorted_period_detail_rows().len()
+            }
+            Tab::Weekly => self.weekly.len(),
+            Tab::Monthly => self.monthly.len(),
+            Tab::Yearly => self.yearly.len(),
             Tab::Hourly => self.data.hourly.len(),
             Tab::Minutely => self.data.minutely.len(),
             Tab::Stats => {
@@ -1278,7 +1371,9 @@ impl App {
             self.sort_direction = SortDirection::Descending;
         }
         self.persist_current_sort();
-        if self.current_tab == Tab::Daily && self.is_daily_detail_active() {
+        if (self.current_tab == Tab::Daily && self.is_daily_detail_active())
+            || (self.current_period_kind().is_some() && self.is_period_detail_active())
+        {
             self.selected_index = 0;
             self.scroll_offset = 0;
         } else {
@@ -1291,37 +1386,63 @@ impl App {
     }
 
     fn jump_to_today(&mut self) {
-        if self.current_tab != Tab::Daily {
+        let today = chrono::Local::now().date_naive();
+
+        if self.current_tab == Tab::Daily {
+            self.selected_daily_detail_date = None;
+            let (today_index, total_len) = {
+                let sorted_daily = self.get_sorted_daily();
+                (
+                    sorted_daily.iter().position(|d| d.date == today),
+                    sorted_daily.len(),
+                )
+            };
+            match today_index {
+                Some(index) => {
+                    self.scroll_to_jump_target(index, total_len);
+                    self.set_status("Jumped to today's usage");
+                }
+                None => self.set_status("No usage recorded for today"),
+            }
             return;
         }
-        self.selected_daily_detail_date = None;
 
-        let today = chrono::Local::now().date_naive();
-        let (today_index, total_len) = {
-            let sorted_daily = self.get_sorted_daily();
-            (
-                sorted_daily.iter().position(|d| d.date == today),
-                sorted_daily.len(),
-            )
-        };
-
-        if let Some(index) = today_index {
-            self.selected_index = index;
-
-            if self.max_visible_items > 0 {
-                let max_scroll = total_len.saturating_sub(self.max_visible_items);
-                self.scroll_offset = index
-                    .saturating_sub(self.max_visible_items / 2)
-                    .min(max_scroll);
-            } else {
-                self.scroll_offset = 0;
+        if self.current_period_kind().is_some() {
+            self.selected_period_detail_key = None;
+            let (period_index, total_len) = {
+                let sorted = self.get_sorted_periods();
+                (
+                    sorted
+                        .iter()
+                        .position(|p| p.start_date <= today && today <= p.end_date),
+                    sorted.len(),
+                )
+            };
+            match period_index {
+                Some(index) => {
+                    self.scroll_to_jump_target(index, total_len);
+                    self.set_status("Jumped to current period");
+                }
+                None => self.set_status("No usage recorded for the current period"),
             }
-
-            self.selected_graph_cell = None;
-            self.set_status("Jumped to today's usage");
-        } else {
-            self.set_status("No usage recorded for today");
         }
+    }
+
+    /// Center `index` in the viewport (best effort) and clear any selected
+    /// graph cell. Shared by the Daily and period "jump to current" actions.
+    fn scroll_to_jump_target(&mut self, index: usize, total_len: usize) {
+        self.selected_index = index;
+
+        if self.max_visible_items > 0 {
+            let max_scroll = total_len.saturating_sub(self.max_visible_items);
+            self.scroll_offset = index
+                .saturating_sub(self.max_visible_items / 2)
+                .min(max_scroll);
+        } else {
+            self.scroll_offset = 0;
+        }
+
+        self.selected_graph_cell = None;
     }
 
     fn cycle_theme(&mut self) {
@@ -1506,6 +1627,22 @@ impl App {
                 .get_sorted_daily()
                 .get(self.selected_index)
                 .map(|d| format!("{}: {} tokens, ${:.4}", d.date, d.tokens.total(), d.cost)),
+            Tab::Weekly | Tab::Monthly | Tab::Yearly if self.is_period_detail_active() => self
+                .get_sorted_period_detail_rows()
+                .get(self.selected_index)
+                .map(|row| {
+                    format!(
+                        "{} / {}: {} tokens, ${:.4}",
+                        row.source,
+                        row.model,
+                        row.tokens.total(),
+                        row.cost
+                    )
+                }),
+            Tab::Weekly | Tab::Monthly | Tab::Yearly => self
+                .get_sorted_periods()
+                .get(self.selected_index)
+                .map(|p| format!("{}: {} tokens, ${:.4}", p.label, p.tokens.total(), p.cost)),
             Tab::Hourly => self.get_sorted_hourly().get(self.selected_index).map(|h| {
                 format!(
                     "{}: {} tokens, ${:.4}",
@@ -1733,6 +1870,200 @@ impl App {
         }
 
         rows
+    }
+
+    /// The period granularity for the active tab, if it is a period tab.
+    pub fn current_period_kind(&self) -> Option<PeriodKind> {
+        self.current_tab.period_kind()
+    }
+
+    fn period_data(&self, kind: PeriodKind) -> &[PeriodUsage] {
+        match kind {
+            PeriodKind::Week => &self.weekly,
+            PeriodKind::Month => &self.monthly,
+            PeriodKind::Year => &self.yearly,
+        }
+    }
+
+    /// Number of buckets on the active period tab (0 when not a period tab).
+    /// Cheap: no sorting, used by the footer count label each frame.
+    pub fn active_period_len(&self) -> usize {
+        self.current_period_kind()
+            .map(|kind| self.period_data(kind).len())
+            .unwrap_or(0)
+    }
+
+    /// Buckets for the active period tab, sorted by the current sort field.
+    /// Empty when the active tab is not a period tab. `Date` sorting uses each
+    /// period's `start_date`.
+    pub fn get_sorted_periods(&self) -> Vec<&PeriodUsage> {
+        let Some(kind) = self.current_period_kind() else {
+            return Vec::new();
+        };
+        let mut periods: Vec<&PeriodUsage> = self.period_data(kind).iter().collect();
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => periods.sort_by(|a, b| {
+                b.cost
+                    .total_cmp(&a.cost)
+                    .then_with(|| a.start_date.cmp(&b.start_date))
+            }),
+            (SortField::Cost, SortDirection::Ascending) => periods.sort_by(|a, b| {
+                a.cost
+                    .total_cmp(&b.cost)
+                    .then_with(|| a.start_date.cmp(&b.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Descending) => periods.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| a.start_date.cmp(&b.start_date))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => periods.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| a.start_date.cmp(&b.start_date))
+            }),
+            (SortField::Date, SortDirection::Descending) => {
+                periods.sort_by_key(|p| std::cmp::Reverse(p.start_date))
+            }
+            (SortField::Date, SortDirection::Ascending) => {
+                periods.sort_by_key(|p| p.start_date)
+            }
+        }
+
+        periods
+    }
+
+    pub fn is_period_detail_active(&self) -> bool {
+        self.selected_period_detail_key.is_some()
+    }
+
+    /// Display label of the period currently drilled into, if any.
+    pub fn period_detail_label(&self) -> Option<String> {
+        let key = self.selected_period_detail_key.as_ref()?;
+        let kind = self.current_period_kind()?;
+        self.period_data(kind)
+            .iter()
+            .find(|p| &p.key == key)
+            .map(|p| p.label.clone())
+    }
+
+    /// Per-source/per-model rows for the drilled-into period, sorted by the
+    /// current sort field. Reuses [`DailyDetailRow`] since period buckets
+    /// carry the same `source_breakdown` shape as daily buckets.
+    pub fn get_sorted_period_detail_rows(&self) -> Vec<DailyDetailRow<'_>> {
+        let Some(key) = self.selected_period_detail_key.as_ref() else {
+            return Vec::new();
+        };
+        let Some(kind) = self.current_period_kind() else {
+            return Vec::new();
+        };
+        let Some(period) = self.period_data(kind).iter().find(|p| &p.key == key) else {
+            return Vec::new();
+        };
+
+        let mut rows: Vec<DailyDetailRow<'_>> = period
+            .source_breakdown
+            .iter()
+            .flat_map(|(source, source_info)| {
+                source_info
+                    .models
+                    .values()
+                    .map(move |model_info| DailyDetailRow {
+                        source,
+                        provider: &model_info.provider,
+                        model: &model_info.display_name,
+                        color_key: &model_info.color_key,
+                        tokens: &model_info.tokens,
+                        cost: model_info.cost,
+                        messages: model_info.messages,
+                    })
+            })
+            .collect();
+
+        let tie_breaker = |a: &DailyDetailRow<'_>, b: &DailyDetailRow<'_>| {
+            a.source
+                .cmp(b.source)
+                .then_with(|| a.model.cmp(b.model))
+                .then_with(|| a.provider.cmp(b.provider))
+        };
+
+        match (self.sort_field, self.sort_direction) {
+            (SortField::Cost, SortDirection::Descending) => {
+                rows.sort_by(|a, b| b.cost.total_cmp(&a.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Cost, SortDirection::Ascending) => {
+                rows.sort_by(|a, b| a.cost.total_cmp(&b.cost).then_with(|| tie_breaker(a, b)))
+            }
+            (SortField::Tokens, SortDirection::Descending) => rows.sort_by(|a, b| {
+                b.tokens
+                    .total()
+                    .cmp(&a.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Tokens, SortDirection::Ascending) => rows.sort_by(|a, b| {
+                a.tokens
+                    .total()
+                    .cmp(&b.tokens.total())
+                    .then_with(|| tie_breaker(a, b))
+            }),
+            (SortField::Date, _) => rows.sort_by(tie_breaker),
+        }
+
+        rows
+    }
+
+    fn open_selected_period_detail(&mut self) {
+        if self.is_period_detail_active() {
+            return;
+        }
+
+        let selected_key = {
+            let periods = self.get_sorted_periods();
+            periods.get(self.selected_index).map(|p| p.key.clone())
+        };
+
+        if let Some(key) = selected_key {
+            self.period_list_selected_index = self.selected_index;
+            self.period_list_scroll_offset = self.scroll_offset;
+            self.selected_period_detail_key = Some(key.clone());
+            self.selected_index = 0;
+            self.scroll_offset = 0;
+            self.set_status(&format!("Viewing details for {}", key));
+            self.clamp_selection();
+        }
+    }
+
+    fn close_period_detail(&mut self) {
+        let Some(detail_key) = self.selected_period_detail_key.clone() else {
+            return;
+        };
+
+        self.selected_period_detail_key = None;
+
+        // Re-anchor by key so a sort change inside detail mode still restores
+        // the same period rather than a stale list index.
+        let restored_index = self
+            .get_sorted_periods()
+            .iter()
+            .position(|p| p.key == detail_key)
+            .unwrap_or(self.period_list_selected_index);
+
+        self.selected_index = restored_index;
+
+        let max_visible = self.max_visible_items.max(1);
+        let viewport_still_holds = restored_index >= self.period_list_scroll_offset
+            && restored_index < self.period_list_scroll_offset + max_visible;
+        self.scroll_offset = if viewport_still_holds {
+            self.period_list_scroll_offset
+        } else {
+            restored_index.saturating_sub(max_visible / 2)
+        };
+
+        self.set_status("Returned to usage list");
+        self.clamp_selection();
     }
 
     pub fn get_sorted_hourly(&self) -> Vec<&HourlyUsage> {
@@ -2075,15 +2406,18 @@ mod tests {
     #[test]
     fn test_tab_all() {
         let tabs = Tab::all();
-        assert_eq!(tabs.len(), 8);
+        assert_eq!(tabs.len(), 11);
         assert_eq!(tabs[0], Tab::Overview);
         assert_eq!(tabs[1], Tab::Usage);
         assert_eq!(tabs[2], Tab::Models);
         assert_eq!(tabs[3], Tab::Daily);
-        assert_eq!(tabs[4], Tab::Hourly);
-        assert_eq!(tabs[5], Tab::Minutely);
-        assert_eq!(tabs[6], Tab::Stats);
-        assert_eq!(tabs[7], Tab::Agents);
+        assert_eq!(tabs[4], Tab::Weekly);
+        assert_eq!(tabs[5], Tab::Monthly);
+        assert_eq!(tabs[6], Tab::Yearly);
+        assert_eq!(tabs[7], Tab::Hourly);
+        assert_eq!(tabs[8], Tab::Minutely);
+        assert_eq!(tabs[9], Tab::Stats);
+        assert_eq!(tabs[10], Tab::Agents);
     }
 
     #[test]
@@ -2091,7 +2425,10 @@ mod tests {
         assert_eq!(Tab::Overview.next(), Tab::Usage);
         assert_eq!(Tab::Usage.next(), Tab::Models);
         assert_eq!(Tab::Models.next(), Tab::Daily);
-        assert_eq!(Tab::Daily.next(), Tab::Hourly);
+        assert_eq!(Tab::Daily.next(), Tab::Weekly);
+        assert_eq!(Tab::Weekly.next(), Tab::Monthly);
+        assert_eq!(Tab::Monthly.next(), Tab::Yearly);
+        assert_eq!(Tab::Yearly.next(), Tab::Hourly);
         assert_eq!(Tab::Hourly.next(), Tab::Minutely);
         assert_eq!(Tab::Minutely.next(), Tab::Stats);
         assert_eq!(Tab::Stats.next(), Tab::Agents);
@@ -2104,7 +2441,10 @@ mod tests {
         assert_eq!(Tab::Usage.prev(), Tab::Overview);
         assert_eq!(Tab::Models.prev(), Tab::Usage);
         assert_eq!(Tab::Daily.prev(), Tab::Models);
-        assert_eq!(Tab::Hourly.prev(), Tab::Daily);
+        assert_eq!(Tab::Weekly.prev(), Tab::Daily);
+        assert_eq!(Tab::Monthly.prev(), Tab::Weekly);
+        assert_eq!(Tab::Yearly.prev(), Tab::Monthly);
+        assert_eq!(Tab::Hourly.prev(), Tab::Yearly);
         assert_eq!(Tab::Minutely.prev(), Tab::Hourly);
         assert_eq!(Tab::Stats.prev(), Tab::Minutely);
         assert_eq!(Tab::Agents.prev(), Tab::Stats);
@@ -2601,26 +2941,22 @@ mod tests {
         let mut app = make_app();
         assert_eq!(app.current_tab, Tab::Overview);
 
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Usage);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Models);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Daily);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Hourly);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Stats);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Agents);
-
-        app.handle_key_event(key(KeyCode::Tab));
-        assert_eq!(app.current_tab, Tab::Overview);
+        for expected in [
+            Tab::Usage,
+            Tab::Models,
+            Tab::Daily,
+            Tab::Weekly,
+            Tab::Monthly,
+            Tab::Yearly,
+            Tab::Hourly,
+            // Minutely is hidden by default and skipped by navigation.
+            Tab::Stats,
+            Tab::Agents,
+            Tab::Overview,
+        ] {
+            app.handle_key_event(key(KeyCode::Tab));
+            assert_eq!(app.current_tab, expected);
+        }
     }
 
     #[test]
@@ -2628,26 +2964,22 @@ mod tests {
         let mut app = make_app();
         assert_eq!(app.current_tab, Tab::Overview);
 
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Agents);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Stats);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Hourly);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Daily);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Models);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Usage);
-
-        app.handle_key_event(key(KeyCode::BackTab));
-        assert_eq!(app.current_tab, Tab::Overview);
+        for expected in [
+            Tab::Agents,
+            Tab::Stats,
+            // Minutely is hidden by default and skipped by navigation.
+            Tab::Hourly,
+            Tab::Yearly,
+            Tab::Monthly,
+            Tab::Weekly,
+            Tab::Daily,
+            Tab::Models,
+            Tab::Usage,
+            Tab::Overview,
+        ] {
+            app.handle_key_event(key(KeyCode::BackTab));
+            assert_eq!(app.current_tab, expected);
+        }
     }
 
     #[test]
@@ -2660,6 +2992,9 @@ mod tests {
             Tab::Usage,
             Tab::Models,
             Tab::Daily,
+            Tab::Weekly,
+            Tab::Monthly,
+            Tab::Yearly,
             Tab::Hourly,
             Tab::Minutely,
             Tab::Stats,
@@ -4022,5 +4357,103 @@ mod tests {
             app.model_color_for("anthropic", "sonnet-shared"),
             app.model_color_for("openai", "sonnet-shared")
         );
+    }
+
+    // ── Weekly / Monthly / Yearly period tabs ───────────────────────
+
+    fn app_with_period_data() -> App {
+        let mut app = make_app();
+        // 2026-05-19 (Tue) and 2026-05-20 (Wed) share one ISO week and the
+        // month of May; 2026-06-01 (Mon) is a separate week and month. All
+        // three fall in 2026.
+        let data = UsageData {
+            daily: vec![
+                daily_usage("2026-05-19", 0.0, vec![("m1", "anthropic", 2.0)]),
+                daily_usage("2026-05-20", 0.0, vec![("m1", "anthropic", 3.0)]),
+                daily_usage("2026-06-01", 0.0, vec![("m2", "openai", 5.0)]),
+            ],
+            ..Default::default()
+        };
+        app.update_data(data);
+        app.sort_field = SortField::Date;
+        app.sort_direction = SortDirection::Descending;
+        app
+    }
+
+    #[test]
+    fn test_period_tabs_aggregate_daily_into_buckets() {
+        let mut app = app_with_period_data();
+
+        app.current_tab = Tab::Weekly;
+        // Two May days collapse into one ISO week; June 1 is its own week.
+        assert_eq!(app.get_sorted_periods().len(), 2);
+
+        app.current_tab = Tab::Monthly;
+        let monthly = app.get_sorted_periods();
+        assert_eq!(monthly.len(), 2);
+        assert_eq!(monthly[0].label, "2026-06");
+        assert_eq!(monthly[1].label, "2026-05");
+        assert!((monthly[1].cost - 5.0).abs() < 1e-9); // 2.0 + 3.0 merged
+
+        app.current_tab = Tab::Yearly;
+        let yearly = app.get_sorted_periods();
+        assert_eq!(yearly.len(), 1);
+        assert_eq!(yearly[0].label, "2026");
+        assert!((yearly[0].cost - 10.0).abs() < 1e-9);
+        assert_eq!(yearly[0].message_count, 3);
+    }
+
+    #[test]
+    fn test_period_detail_open_and_close_merges_models() {
+        let mut app = app_with_period_data();
+        app.current_tab = Tab::Monthly;
+
+        // Sorted Date-desc: index 0 = June, index 1 = May.
+        app.selected_index = 1;
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_period_detail_active());
+        assert_eq!(app.period_detail_label().as_deref(), Some("2026-05"));
+
+        // May merged two days of the same source+model into one detail row.
+        let rows = app.get_sorted_period_detail_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "m1");
+        assert_eq!(rows[0].source, "claude");
+        assert!((rows[0].cost - 5.0).abs() < 1e-9);
+
+        app.handle_key_event(key(KeyCode::Esc));
+        assert!(!app.is_period_detail_active());
+        assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn test_switching_tabs_clears_period_detail() {
+        let mut app = app_with_period_data();
+        app.current_tab = Tab::Weekly;
+        app.selected_index = 0;
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_period_detail_active());
+
+        app.handle_key_event(key(KeyCode::Tab));
+        assert!(!app.is_period_detail_active());
+    }
+
+    #[test]
+    fn test_update_data_exits_period_detail_when_period_disappears() {
+        let mut app = app_with_period_data();
+        app.current_tab = Tab::Monthly;
+        app.selected_index = 1; // May
+        app.handle_key_event(key(KeyCode::Enter));
+        assert!(app.is_period_detail_active());
+
+        // Refresh with only June data — the May period is gone.
+        let refreshed = UsageData {
+            daily: vec![daily_usage("2026-06-01", 0.0, vec![("m2", "openai", 5.0)])],
+            ..Default::default()
+        };
+        app.update_data(refreshed);
+
+        assert!(!app.is_period_detail_active());
+        assert!(app.get_sorted_period_detail_rows().is_empty());
     }
 }

@@ -101,6 +101,34 @@ pub struct DailyUsage {
     pub turn_count: u32,
 }
 
+/// Calendar granularity for the Weekly/Monthly/Yearly tabs. Each variant
+/// re-buckets the per-day [`DailyUsage`] entries into a coarser period so
+/// those tabs can mirror the Daily view without a second pass over messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodKind {
+    Week,
+    Month,
+    Year,
+}
+
+/// A single Weekly/Monthly/Yearly bucket. Mirrors [`DailyUsage`] but is keyed
+/// by a calendar period (`key`/`label`) and carries the inclusive date range
+/// (`start_date`..=`end_date`) so the UI can highlight and jump to the period
+/// containing today. `source_breakdown` reuses the Daily shape so the detail
+/// drill-down code is shared.
+#[derive(Debug, Clone)]
+pub struct PeriodUsage {
+    pub key: String,
+    pub label: String,
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    pub tokens: TokenBreakdown,
+    pub cost: f64,
+    pub source_breakdown: BTreeMap<String, DailySourceInfo>,
+    pub message_count: u32,
+    pub turn_count: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct HourlyModelInfo {
     pub provider: String,
@@ -985,6 +1013,122 @@ fn minute_bucket_with_fallback(timestamp_ms: i64, date_str: &str) -> Option<Naiv
         return Some(dt);
     }
     parse_date(date_str).and_then(|d| d.and_hms_opt(0, 0, 0))
+}
+
+fn add_tokens(dest: &mut TokenBreakdown, src: &TokenBreakdown) {
+    dest.input = dest.input.saturating_add(src.input);
+    dest.output = dest.output.saturating_add(src.output);
+    dest.cache_read = dest.cache_read.saturating_add(src.cache_read);
+    dest.cache_write = dest.cache_write.saturating_add(src.cache_write);
+    dest.reasoning = dest.reasoning.saturating_add(src.reasoning);
+}
+
+/// Merge one day's per-client/per-model `source_breakdown` into an
+/// accumulating period breakdown. Provider/display/color metadata is taken
+/// from whichever day is seen first for a given client+model key (the values
+/// are stable across days for the active group-by).
+fn merge_source_breakdown(
+    dest: &mut BTreeMap<String, DailySourceInfo>,
+    src: &BTreeMap<String, DailySourceInfo>,
+) {
+    for (client, src_info) in src {
+        let entry = dest
+            .entry(client.clone())
+            .or_insert_with(|| DailySourceInfo {
+                tokens: TokenBreakdown::default(),
+                cost: 0.0,
+                models: BTreeMap::new(),
+            });
+        add_tokens(&mut entry.tokens, &src_info.tokens);
+        entry.cost += src_info.cost;
+        for (model_key, model_info) in &src_info.models {
+            let model_entry =
+                entry
+                    .models
+                    .entry(model_key.clone())
+                    .or_insert_with(|| DailyModelInfo {
+                        provider: model_info.provider.clone(),
+                        display_name: model_info.display_name.clone(),
+                        color_key: model_info.color_key.clone(),
+                        tokens: TokenBreakdown::default(),
+                        cost: 0.0,
+                        messages: 0,
+                    });
+            add_tokens(&mut model_entry.tokens, &model_info.tokens);
+            model_entry.cost += model_info.cost;
+            model_entry.messages = model_entry.messages.saturating_add(model_info.messages);
+        }
+    }
+}
+
+fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    NaiveDate::from_ymd_opt(next_year, next_month, 1)
+        .and_then(|first_of_next| first_of_next.pred_opt())
+        .or_else(|| NaiveDate::from_ymd_opt(year, month, 28))
+        .unwrap_or_else(|| Local::now().date_naive())
+}
+
+/// Resolve the `(key, label, start_date, end_date)` for the period that
+/// `date` falls in, for the given granularity. The key is used both for
+/// display and as the map/detail lookup key, so it must be unique per period.
+fn period_bounds(date: NaiveDate, kind: PeriodKind) -> (String, NaiveDate, NaiveDate) {
+    match kind {
+        PeriodKind::Week => {
+            let iso = date.iso_week();
+            let start = NaiveDate::from_isoywd_opt(iso.year(), iso.week(), chrono::Weekday::Mon)
+                .unwrap_or(date);
+            let end = start + chrono::Duration::days(6);
+            (format!("{}-W{:02}", iso.year(), iso.week()), start, end)
+        }
+        PeriodKind::Month => {
+            let start = NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date);
+            let end = last_day_of_month(date.year(), date.month());
+            (format!("{:04}-{:02}", date.year(), date.month()), start, end)
+        }
+        PeriodKind::Year => {
+            let start = NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date);
+            let end = NaiveDate::from_ymd_opt(date.year(), 12, 31).unwrap_or(date);
+            (format!("{:04}", date.year()), start, end)
+        }
+    }
+}
+
+/// Re-bucket already-aggregated per-day usage into Weekly/Monthly/Yearly
+/// periods. Derived from [`DailyUsage`] (not from raw messages) so the period
+/// tabs stay free and consistent with the Daily tab. Returns entries sorted
+/// newest-first, matching the default Daily ordering.
+pub fn aggregate_periods(daily: &[DailyUsage], kind: PeriodKind) -> Vec<PeriodUsage> {
+    let mut periods: HashMap<String, PeriodUsage> = HashMap::new();
+
+    for day in daily {
+        let (key, start_date, end_date) = period_bounds(day.date, kind);
+        let entry = periods.entry(key.clone()).or_insert_with(|| PeriodUsage {
+            key: key.clone(),
+            label: key.clone(),
+            start_date,
+            end_date,
+            tokens: TokenBreakdown::default(),
+            cost: 0.0,
+            source_breakdown: BTreeMap::new(),
+            message_count: 0,
+            turn_count: 0,
+        });
+
+        add_tokens(&mut entry.tokens, &day.tokens);
+        entry.cost += day.cost;
+        entry.message_count = entry.message_count.saturating_add(day.message_count);
+        entry.turn_count = entry.turn_count.saturating_add(day.turn_count);
+        merge_source_breakdown(&mut entry.source_breakdown, &day.source_breakdown);
+    }
+
+    let mut periods: Vec<PeriodUsage> = periods.into_values().collect();
+    periods.sort_by(|a, b| b.start_date.cmp(&a.start_date));
+    periods
 }
 
 fn build_contribution_graph(daily: &[DailyUsage]) -> GraphData {
